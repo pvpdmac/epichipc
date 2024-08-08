@@ -1,0 +1,114 @@
+---
+title: "Enriched Heatmap"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(GenomicRanges)
+library(annotatr)
+library(regioneR)
+library(plyranges)
+library(reshape2)
+library(msigdbr)
+library(clusterProfiler)
+library(EnrichedHeatmap)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+load(file.path(datadir,'celldmc.R'))
+dmrs <- read.csv(file = file.path(reportdir,'GAM.main.dmrs.csv'),row.names = 1)
+dmps <- read.csv(file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'),row.names = 1)
+```
+
+
+# EnrichHeatMap
+
+```{r}
+#Calculate methylation values
+meth.val.v1 = round(rowMeans(Beta.main[dmps$ProbeID,meta.main$Visit_Num=='V1']),2)
+meth.val.v2 = round(rowMeans(Beta.main[dmps$ProbeID,meta.main$Visit_Num=='V2']),2)
+meth.diff = meth.val.v2 - meth.val.v1
+
+meth = map.main[dmps$ProbeID,] %>%
+  as_tibble() %>%
+  dplyr::select(chr, pos, strand) %>%
+  add_column(meth.val.v1, meth.val.v2, meth.diff) %>%
+  dplyr::rename(seqnames=chr, start=pos) %>%
+  mutate(end = start+1) %>%
+  GRanges()
+
+
+cgislands = build_annotations(genome = 'hg19', annotations =c("hg19_cpg_islands"))
+
+cgisland.ranges <- meth %>%
+  join_overlap_inner(cgislands)
+
+#color function
+meth_col_fun = colorRamp2(c(0, 0.5, 1), c("blue", "white", "red"))
+
+mat.v1 = normalizeToMatrix(meth, cgisland.ranges, value_column = "meth.val.v1", mean_mode = "absolute",
+extend = 5000, w = 50, background = NA, smooth = TRUE, target_ratio = 0.3)
+
+mat.v2 = normalizeToMatrix(meth, cgisland.ranges, value_column = "meth.val.v2", mean_mode = "absolute",
+extend = 5000, w = 50, background = NA, smooth = TRUE, target_ratio = 0.3)
+
+mat.v3 = normalizeToMatrix(meth, cgisland.ranges, value_column = "meth.diff", mean_mode = "absolute",
+extend = 5000, w = 50, background = NA, smooth = TRUE, target_ratio = 0.3)
+
+#remove failed rows
+#mat.v1 = mat.v1[-failed_rows(mat.v1),]
+EnrichedHeatmap(mat.v1, col = meth_col_fun, name = "methylationv1", column_title = "methylation near CG Island V1", axis_name_rot = 90, use_raster=T)+
+  EnrichedHeatmap(mat.v2, col = meth_col_fun, name = "methylationv2", column_title = "methylation near CG Island V2", axis_name_rot = 90, use_raster=T)+
+  EnrichedHeatmap(mat.v3, col = meth_col_fun, name = "methylationdiff", column_title = "methylation near CG Island DIFF", axis_name_rot = 90, use_raster=T)
+
+```

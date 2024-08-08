@@ -1,0 +1,313 @@
+---
+title: "Cell Count Analysis"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+```
+
+# Estimate cell ratios
+```{r}
+blood.cnt.main <- epidish(Beta.main, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as_tibble() %>%
+  round(digits = 2)
+
+blood.cnt.ont <- epidish(Beta.ont, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as_tibble() %>%
+  round(digits = 2)
+
+df.m <- meta.main %>%
+  dplyr::select(Sample_Name,DOL, Days) %>%
+  cbind(blood.cnt.main) %>%
+  mutate(Cohort= rep('Main',nrow(meta.main)))
+
+df.m.long <- pivot_longer(df.m, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df.o <- meta.ont %>%
+  dplyr::select(Sample_Name,DOL, Days) %>%
+  cbind(blood.cnt.ont) %>%
+  mutate(Cohort= rep('Ontogeny',nrow(meta.ont)))
+
+df.o.long <- pivot_longer(df.o, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df.cells <- rbind(df.m.long, df.o.long)
+```
+
+
+# Plot cell ratios
+```{r}
+
+#my_comparisons = list(c("0", "1"), c("0", "3"), c("0", "7"))
+
+ggboxplot(df.cells, "cells", "value", fill = "DOL",
+          palette= c('#440154','#31688E','#35B779','#FDE725'),
+          facet.by = 'Cohort') +
+  labs(title = 'cell ratio', x = "Cell type", y = "Ratio")  +
+  #stat_compare_means(comparisons = my_comparisons, label = "p.signif")  +
+        theme_bw(base_rect_size = 2, base_size = 20) + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+```
+
+
+
+```{r}
+png(file.path(plotdir,'boxplot_cellratios.png'), width = 900, height = 600 )
+
+
+ggboxplot(df.cells, "cells", "value", fill = "DOL",
+          palette= c('#440154','#31688E','#35B779','#FDE725'),
+          facet.by = 'Cohort') +
+  labs(title = 'Estimated cell counts', x = "Cell type", y = "Ratio")  +
+  #stat_compare_means(comparisons = my_comparisons, label = "p.signif")  +
+        theme_bw(base_rect_size = 2,base_size = 20) + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+dev.off()
+
+```
+## RM-ANOVA
+
+### Main cohort
+```{r}
+library(rstatix)
+
+df.m <- meta.main %>%
+  dplyr::select(Unique_Identifier,DOL, Days) %>%
+  cbind(blood.cnt.main) %>%
+  mutate(Cohort= rep('Main',nrow(meta.main)))
+
+df.m.long <- pivot_longer(df.m, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df_filtered <- df.m.long %>% 
+  filter(cells == "CD4T") %>%  # Focus on CD4T cells
+  select(Unique_Identifier, DOL, value)  # Select relevant columns
+```
+
+```{r}
+# Convert DOL to a factor (required for within-subject variable)
+df_filtered$DOL <- as.factor(df_filtered$DOL)
+
+# Perform repeated measures ANOVA
+res.aov <- anova_test(data = df_filtered, value ~ DOL, dv = value, wid = Unique_Identifier, within = DOL)
+
+# Print ANOVA results
+get_anova_table(res.aov)
+```
+
+```{r}
+library(rstatix)
+
+df.m <- meta.main %>%
+  dplyr::select(Unique_Identifier,DOL, Days) %>%
+  cbind(blood.cnt.main) %>%
+  mutate(Cohort= rep('Main',nrow(meta.main)))
+
+df.m.long <- pivot_longer(df.m, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df_filtered <- df.m.long %>% 
+  filter(cells == "Neutro") %>%  # Focus on CD4T cells
+  select(Unique_Identifier, DOL, value)  # Select relevant columns
+```
+
+
+```{r}
+# Convert DOL to a factor (required for within-subject variable)
+df_filtered$DOL <- as.factor(df_filtered$DOL)
+
+# Perform repeated measures ANOVA
+res.aov <- anova_test(data = df_filtered, value ~ DOL, dv = value, wid = Unique_Identifier, within = DOL)
+
+# Print ANOVA results
+get_anova_table(res.aov)
+```
+
+### Validation
+
+```{r}
+df.o <- meta.ont %>%
+  dplyr::select(Unique.Identifier,DOL, Days) %>%
+  cbind(blood.cnt.ont) %>%
+  mutate(Cohort= rep('Validation',nrow(meta.ont)))
+
+df.m.long <- pivot_longer(df.m, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df_filtered <- df.m.long %>% 
+  filter(cells == "CD4T") %>%  # Focus on CD4T cells
+  select(Unique_Identifier, DOL, value)  # Select relevant columns
+
+# Convert DOL to a factor (required for within-subject variable)
+df_filtered$DOL <- as.factor(df_filtered$DOL)
+
+# Perform repeated measures ANOVA
+res.aov <- anova_test(data = df_filtered, value ~ DOL, dv = value, wid = Unique_Identifier, within = DOL)
+
+# Print ANOVA results
+get_anova_table(res.aov)
+```
+
+```{r}
+df.o <- meta.ont %>%
+  dplyr::select(Unique.Identifier,DOL, Days) %>%
+  cbind(blood.cnt.ont) %>%
+  mutate(Cohort= rep('Validation',nrow(meta.ont)))
+
+df.m.long <- pivot_longer(df.m, cols = c(B, NK, CD4T, CD8T, Mono, Neutro, Eosino), names_to = 'cells')
+
+df_filtered <- df.m.long %>% 
+  filter(cells == "Neutro") %>%  # Focus on CD4T cells
+  select(Unique_Identifier, DOL, value)  # Select relevant columns
+
+# Convert DOL to a factor (required for within-subject variable)
+df_filtered$DOL <- as.factor(df_filtered$DOL)
+
+# Perform repeated measures ANOVA
+res.aov <- anova_test(data = df_filtered, value ~ DOL, dv = value, wid = Unique_Identifier, within = DOL)
+
+# Print ANOVA results
+get_anova_table(res.aov)
+```
+
+# Confirmation by flow
+
+```{r}
+
+  bcell_panel <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_BCELL_UL_BLOOD.csv",
+                                         row.names = 1,
+                                         stringsAsFactors=FALSE)
+  
+
+   myeloid_panel <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_MYELOID_UL_BLOOD.csv",
+                                         row.names = 1,
+                                         stringsAsFactors=FALSE)
+
+
+colnames(bcell_panel) <- make.names(colnames(bcell_panel))  
+colnames(myeloid_panel) <- make.names(colnames(myeloid_panel))
+
+#remove flowjow exp data from sample name
+bcell_panel$name = gsub('.*(\\w{4}).*', '\\1', bcell_panel$name)
+myeloid_panel$name = gsub('.*(\\w{4}).*', '\\1', myeloid_panel$name)
+
+flowcyt <- full_join(bcell_panel[,-c(2:4)], myeloid_panel, by= c('name'))
+
+```
+
+
+```{r}
+fc.dat <- flowcyt %>%
+  dplyr::select('name','CD19..B.cells',
+                'CD3..T.cells','Basophils',
+                'Classical.Monocytes',
+                'CD11b.CD16..Mature.Neutrophils',
+                'CD56.Hi.NK') %>%
+  dplyr::rename('B' = 'CD19..B.cells') %>%
+  dplyr::rename('CD3T' = 'CD3..T.cells') %>%
+  dplyr::rename('Mono' = 'Classical.Monocytes') %>%
+  dplyr::rename('NK' = 'CD56.Hi.NK') %>%
+  dplyr::rename('Neutro' = 'CD11b.CD16..Mature.Neutrophils') %>%
+  dplyr::rename('Baso' = 'Basophils') %>%
+  dplyr::rename('Sample_Name' = 'name')
+```
+
+
+```{r}
+#join to metadata
+cell.join = join_meta(fc.dat, meta.main) %>%
+dplyr::select(Sample_Name,DOL, Days, B, CD3T, Baso,Mono,Neutro, NK) 
+
+df.flow <- pivot_longer(cell.join, cols = c(B, CD3T, Baso,Mono,Neutro, NK), names_to = 'cells')
+```
+
+# Plot flow cytometry
+```{r}
+
+ggboxplot(df.flow, "cells", "value", fill = "DOL",
+          palette= c('#440154','#31688E','#35B779','#FDE725')) +
+  labs(title = 'cell ratio', x = "Cell type", y = "Ratio")  +
+  #stat_compare_means(comparisons = my_comparisons, label = "p.signif")  +
+        theme_bw(base_rect_size = 2, base_size = 20) + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+```
+
+```{r}
+png(file.path(plotdir,'boxplot_cellratios_flow.png'), width = 600, height = 600 )
+
+ggboxplot(df.flow, "cells", "value", fill = "DOL",
+          palette= c('#440154','#31688E','#35B779','#FDE725')) +
+  labs(title = 'cell ratio', x = "Cell type", y = "Ratio")  +
+  #stat_compare_means(comparisons = my_comparisons, label = "p.signif")  +
+        theme_bw(base_rect_size = 2, base_size = 20) + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+dev.off()
+```
+
+
+#SessionInfo
+```{r}
+sessionInfo()
+```
+

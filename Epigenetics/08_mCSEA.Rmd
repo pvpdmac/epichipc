@@ -1,0 +1,245 @@
+---
+title: "Promoter Meth Analysis"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+library(DMRcate)
+library(cowplot)
+library(methylclock)
+library(mCSEA)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+
+#rename Sample_Name column
+meta.main <- meta.main %>%
+  dplyr::rename(Visit_ID = Sample_Name)
+
+#loading significant cpgs
+dmrs <- read.csv(file = file.path(reportdir,'GAM.main.dmrs.csv'),row.names = 1)
+dmps <- read.csv(file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'),row.names = 1)
+```
+
+# Estimate cell ratios
+```{r}
+blood.cnt.main <- epidish(Beta.main, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2) %>%
+  as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B)) %>%
+  mutate(log_NLR = log10(NLR))
+
+blood.cnt.ont <- epidish(Beta.ont, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2) %>%
+as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B)) %>%
+  mutate(log_NLR = log10(NLR))
+
+```
+
+
+# Load transcriptomics
+```{r}
+counts <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_RNA_COUNTS.csv",
+                                         row.names = 1,
+                                         stringsAsFactors = FALSE)
+
+counts_clin <- aws.s3::s3read_using(read.csv,
+                                        object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_RNA_META.csv",
+                                        stringsAsFactors = FALSE)
+
+#transpose counts matrix
+counts = as.matrix(t(counts))
+```
+
+## QC on transcriptomics
+```{r}
+#Grab the ones potentially mislabelled
+select.var <- which(is.na(counts_clin$DOL.Mislabel))
+
+#Remove from phenodata
+counts_clin <- counts_clin[select.var,]
+
+#Remove DOL mismatched 
+select.var <- which(colnames(counts) %in% counts_clin$Library.Name)
+counts <- counts[,select.var]
+
+#Grab the ones mismatched sex
+select.var <- which(is.na(counts_clin$Sex.Mislabel))
+
+#Remove from phenodata
+counts_clin <- counts_clin[select.var,]
+
+#Remove Sex mismatch 
+select.var <- which(colnames(counts) %in% counts_clin$Library.Name)
+counts <- counts[,select.var]
+
+
+#fix up missing variable for seq.batch in metadata
+counts_clin$Seq.Batch[17] <- paste('RF-P4-18')
+counts_clin$cDNA.prep[17] <- paste('20180806')
+counts_clin$Sequencer[17] <- paste('HiSeq2500')
+
+#chnage column names to visit ID
+colnames(counts) <- counts_clin$Visit.ID
+```
+
+
+# mCSEA
+
+## Call DMRs
+```{r}
+figs <- file.path(plotdir,"mCSEA_figs")
+```
+
+
+```{r}
+
+#get a sample matching variable reflecting those with matched DNAm and GE
+matched = dplyr::intersect(counts_clin$Visit.ID, meta.main$Visit_ID)
+
+#dmps to test
+probes = dmps$ProbeID
+
+
+#Model definition
+phenoTest <- data.frame(visit = factor(meta.main$Visit_Num),
+                        person = factor(meta.main$Unique_Identifier))
+
+rownames(phenoTest)=colnames(M.main)
+
+#subset to matched only
+phenoTest <- phenoTest[matched,]
+
+myRank <- rankProbes(M.main[probes, matched], phenoTest, 
+                     typeInput = "M",  
+                     typeAnalysis = "beta",
+                     refGroup = "V1",
+                     caseGroup = 'V2',
+                     paired = TRUE,
+                     pairColumn = "person")
+
+#call DMRs
+myResults <- mCSEATest(myRank, Beta.main[probes, matched], phenoTest, nproc = 30, minCpGs = 4,
+regionsTypes = c("promoters", "genes", "CGI"), platform = "EPIC")
+
+#get the stats table
+csea.stats.p = myResults$promoters
+csea.stats.p$region = rep("promotoer",nrow(csea.stats.p))
+
+csea.stats.g = myResults$genes
+csea.stats.g$region = rep("gene",nrow(csea.stats.g))
+
+csea.stats.c = myResults$CGI
+csea.stats.c$region = rep("CGI",nrow(csea.stats.c))
+
+csea.stats = rbind(csea.stats.p, csea.stats.g, csea.stats.c) %>%
+  dplyr::filter(padj <= 0.05)
+
+#write to file
+write.csv(csea.stats, file=file.path(reportdir,"mCSEA_DMRs_visitnum.15AUG23.csv"))
+```
+
+
+## Integrative analysis
+```{r}
+#new matrix of gene expression
+GE.counts <- counts[ , matched]
+
+# Run mCSEAIntegrate function
+resultsInt <- mCSEAIntegrate(myResults, GE.counts, 
+                             regionType = c("promoters", "genes", "CGI"), 
+                             geneIDs ="ENSEMBL",
+                             makePlot = TRUE,
+                             folder = figs,
+                             nproc = 30)
+
+#write to file
+write.csv(resultsInt, file=file.path(reportdir,"mCSEA_Integration.csv"))
+```
+
+
+```{r}
+png(file=file.path(plotdir,'Barchart.mCSEA.integration.png'), width = 600, height = 600)
+
+df <- data.frame(num.assoc.genes = table(resultsInt$regionType))
+
+colnames(df) = c('region','DEGs')
+
+ggbarplot(df, x = "region", y = "DEGs",
+          fill = "region",               
+          color = "white",            
+          palette = "jco",            
+          sort.val = "desc",          
+          sort.by.groups = FALSE,     
+          x.text.angle = 45,         
+          ggtheme = theme_pubr(base_size = 24)) 
+
+dev.off()
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,588 @@
+---
+title: "EWAS models"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+library(DMRcate)
+library(cowplot)
+library(methylclock)
+library(variancePartition)
+library(missMethyl)
+library(tidyverse)
+library(mixOmics)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+```
+
+# Estimate cell ratios
+```{r}
+blood.cnt.main <- epidish(Beta.main, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2)
+
+blood.cnt.ont <- epidish(Beta.ont, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2)
+
+```
+
+# Differential methylation testing
+
+## Model unwanted variation
+
+```{r}
+#Model definition
+design <- model.matrix(~ Sample_Plate + Sex, meta.main)
+
+#fit M vals
+M.fit <- lmFit(M.main, design)
+
+#extract model residuals
+res <- residuals(M.fit, M.main)
+
+```
+
+## Within Variation Data Transform
+
+```{r}
+design <- data.frame(sample = factor(meta.main$Unique_Identifier))
+
+Mw <- withinVariation(X=t(res), design=design) # decompose the between individual variation 
+
+Mw <- t(Mw)
+
+#save to file in case need later
+save(Mw, file = file.path(datadir, 'Mwobject.RData'))
+```
+
+# Calling DMCTs
+
+DMCs are called on batch and individual adjusted data set with slide as a covariate
+
+```{r}
+celldmc <- CellDMC(Mw, as.numeric(meta.main$DOL), 
+                   blood.cnt.main, 
+                   adjPMethod = 'fdr',
+                   adjPThresh = 0.05,
+                   sort = T,
+                   cov.mod = model.matrix(~ Slide, meta.main),
+                   mc.cores = 40)
+
+
+DMC = as.data.frame(celldmc$dmct)
+table(DMC$DMC)
+
+
+#write to file
+write.csv(DMC, file= file.path(reportdir,'Epidish_out_full.csv'))
+save(celldmc, file = file.path(datadir,'celldmc.R'))
+
+```
+
+# Evaluating reproducibility
+
+## Subset probes to DOL associated regions
+```{r}
+#get the list of DOL associated probes
+sig.probes <- DMC$ProbeID
+
+#reduce to those measured in both cohorts
+sig.probes <- sig.probes[ which(sig.probes %in% rownames(Beta.ont))]
+
+length(sig.probes)
+```
+
+## Subset ontogeny to African cohort
+
+```{r}
+#subset to africans
+meta.ont.gam <- subset(meta.ont, Site=='GAM')
+
+#subset data sets
+M.ont.gam = M.ont[, colnames(M.ont) %in% meta.ont.gam$Sample_Name]
+B.ont.gam = Beta.ont[, colnames(Beta.ont) %in% meta.ont.gam$Sample_Name]
+```
+
+## Fit DOL model MAIN
+```{r}
+#Model definition
+design <- model.matrix(~as.numeric(DOL) + Sex + Sample_Plate, meta.main)
+
+#fit M vals
+M.fit <- lmFit(M.main[sig.probes,], design)
+M.fit <- eBayes(M.fit)
+
+tt.main <- topTable(M.fit, coef = 2, number = Inf, sort.by = 'none')
+```
+
+## Fit DOL model Ontogeny
+```{r}
+#Model definition
+design <- model.matrix(~as.numeric(DOL) + Sex + Sample_Plate, meta.ont.gam)
+
+#fit M vals
+M.fit <- lmFit(M.ont.gam[sig.probes,], design)
+M.fit <- eBayes(M.fit)
+
+tt.ont <- topTable(M.fit, coef = 2, number = Inf, sort.by = 'none')
+```
+
+
+```{r}
+df = cbind(tt.main$t, tt.ont$t)
+colnames(df)= c('t.stat.main.cohort', 't.stat.ont.cohort')
+rownames(df) = rownames(tt.main)
+df = as.data.frame(df)
+```
+
+## Plot t statistic correlation
+
+```{r}
+png(file=file.path(plotdir,'tstat_compare.png'), width = 450, height = 400)
+
+   ggscatter(df, x = "t.stat.main.cohort", y = "t.stat.ont.cohort", color = "#e69936",
+    add = "reg.line",  
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = FALSE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.sep = "\n"),
+   cor.coef.size = 6)+
+   labs(title = 'DOL association', x = "t-statistic main", y = "t-statistic ontogeny") + 
+   theme_bw(base_rect_size = 2, base_size = 20) + 
+   theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))
+
+dev.off()
+```
+
+
+```{r}
+df = cbind(tt.main$logFC, tt.ont$logFC)
+colnames(df)= c('effect.main.cohort', 'effect.ont.cohort')
+rownames(df) = rownames(tt.main)
+df = as.data.frame(df)
+```
+
+```{r}
+#create new column for average measurement
+df$avg <- rowMeans(df) 
+
+#create new column for difference in measurements
+df$diff <- df$effect.main.cohort - df$effect.ont.cohort
+
+#find average difference
+mean_diff <- mean(df$diff)
+
+#find lower 95% confidence interval limits
+lower <- mean_diff - 1.96*sd(df$diff)
+
+#find upper 95% confidence interval limits
+upper <- mean_diff + 1.96*sd(df$diff)
+
+```
+
+
+```{r}
+#png(file=file.path(plotdir,'bland_atlman.png'), width = 450, height = 450)
+
+#create Bland-Altman plot
+ggplot(df, aes(x = avg, y = diff)) +
+  geom_point(size=1,color = "#2c2656") +
+  geom_hline(yintercept = mean_diff) +
+  geom_hline(yintercept = lower, color = "red", linetype="dashed") +
+  geom_hline(yintercept = upper, color = "red", linetype="dashed") +
+  ggtitle("Bland-Altman Plot") +
+  ylab("Difference Between Measurements") +
+  xlab("Average Measurement")+
+  theme_bw(base_rect_size = 2, base_size = 20) + 
+   theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(face = "bold"))
+
+#dev.off()
+```
+
+# Longitudinal analysis
+
+fitting a limma model to DOL longitudinally unadjusted for cell count to get the statistics across all cells
+
+```{r}
+#Model definition with DOL as factor variable
+design <- model.matrix(~as.numeric(DOL), meta.main)
+
+#fit M vals
+M.fit <- lmFit(Mw[sig.probes,], design)
+M.fit <- eBayes(M.fit)
+
+Mtt <- topTable(M.fit, coef = 2, number = Inf, sort.by = 'none')
+
+#fit B vals
+B.fit <- lmFit(Beta.main[sig.probes,], design)
+B.fit <- eBayes(B.fit)
+
+Btt <- topTable(B.fit, coef = 2, number = Inf, sort.by = 'none')
+
+#subset annotations
+map.sub <- map.main[sig.probes,]
+
+#EWAS statistics
+annotated <- GRanges(as.character(map.sub$chr), IRanges(map.sub$pos, 
+                map.sub$pos), 
+                stat = Mtt$t, 
+                diff = Btt$logFC, 
+                ind.fdr = Mtt$adj.P.Val, 
+                P.Value = Mtt$P.Value, 
+                is.sig = Mtt$adj.P.Val < 0.05, 
+                ProbeID=rownames(Mtt),
+                Gene=map.sub$UCSC_RefGene_Name)
+names(annotated)=rownames(Mtt)
+annotated <- sort(annotated)
+
+#convert ewas statistics to S4 class
+ewas <- new("CpGannotated", ranges = annotated)
+
+#individual probe result
+stats <-ewas@ranges %>%
+  as_tibble() %>%
+  arrange(ind.fdr)
+
+#print to screen
+stats
+
+#write to file
+write.csv(stats, file = file.path(reportdir,'GAM.main.DOL.dmps_stats.csv'))
+
+stats.02 <- subset(stats, abs(diff) >= 0.02) %>%
+  as_tibble()
+
+#write to file
+write.csv(stats.02, file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'))
+```
+
+
+# Cross-sectional Models
+```{r}
+#Model definition with DOL as factor variable
+design <- model.matrix(~DOL + Sex + Slide, meta.main)
+
+#fit Beta vals
+B.fit <- lmFit(Beta.main[stats.02$ProbeID,], design)
+B.fit <- eBayes(B.fit)
+
+summary(decideTests(B.fit))
+
+```
+
+## statistics for each DOL
+
+In the cross-sectional model, I'm not interested in P value I just want to know about the rate of change
+
+```{r}
+dol1 <- topTable(B.fit, coef = 'DOL1', number = Inf, sort.by = 'none') 
+#dplyr::filter(abs(logFC) >  0.02)
+dol1$ProbeID = rownames(dol1)
+
+
+dol1.up <- dol1 %>%
+  dplyr::filter(logFC > 0)
+dol1.dn <- dol1 %>%
+  dplyr::filter(logFC < 0)
+
+dol3 <- topTable(B.fit, coef = 'DOL3', number = Inf, sort.by = 'none') 
+  #dplyr::filter(abs(logFC) >  0.02)
+dol3$ProbeID = rownames(dol3)
+
+dol3.up <- dol3 %>%
+  dplyr::filter(logFC > 0)
+dol3.dn <- dol3 %>%
+  dplyr::filter(logFC < 0)
+
+dol7 <- topTable(B.fit, coef = 'DOL7', number = Inf, sort.by = 'none') 
+  #dplyr::filter(abs(logFC) >  0.02)
+dol7$ProbeID = rownames(dol7) 
+
+dol7.up <- dol7 %>%
+  dplyr::filter(logFC > 0)
+dol7.dn <- dol7 %>%
+  dplyr::filter(logFC < 0)
+
+
+```
+
+
+
+```{r}
+png(file=file.path(plotdir,'DOLcpg_Barchart.png'), width = 600, height = 500)
+
+df = data.frame( day = c(rep('DOL1',2), rep('DOL3',2), rep('DOL7',2)),
+  group = rep(c('hyper','hypo'), times=3),
+  count = c(mean(dol1.up$logFC)*100,
+            mean(dol1.dn$logFC)*100,
+            mean(dol3.up$logFC)*100,
+            mean(dol3.dn$logFC)*100,
+            mean(dol7.up$logFC)*100,
+            mean(dol7.dn$logFC)*100))
+
+
+ggplot(df, aes(x=day, y=count, fill=group)) + 
+  geom_bar(stat="identity", position="identity") +
+  labs(title = "Average extent of methylation change", x = "Day of Life", y= "Mean effect size v DOL0 (%)") +
+  theme_bw(base_rect_size = 2, base_size = 20) + 
+  theme(plot.title = element_text(hjust = 0.5), 
+        axis.text = element_text(face = "bold"))+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+
+dev.off()
+```
+
+# DMR calling GAM Main
+```{r}
+#DMR finder
+dmrcoutput         <- dmrcate(ewas,lambda=1000, C=2, min.cpgs = 4, pcutoff = 0.05, betacutoff = 0.02)
+
+#convert to data frame and filter 
+dmrs          <- extractRanges(dmrcoutput) %>% 
+                      as.data.frame %>% 
+                      mutate(betaAfc = abs(meandiff)) 
+
+#Print to screen
+dmrs
+
+#write to file
+write.csv(dmrs, file = file.path(reportdir,'GAM.main.dmrs.csv'))
+```
+
+
+```{r}
+png(file=file.path(plotdir,'GAM.main.DMRs.png'), width = 650, height = 600)
+
+dmrs$overlapping.genes = ifelse(is.na(dmrs$overlapping.genes), paste("intragenic"), dmrs$overlapping.genes)
+fun_color_range <- colorRampPalette(c('#ee4035',	'#fdfdff',	'#423f3b'))
+
+my_colors <- fun_color_range(3)  
+
+ggscatter(dmrs, x = "maxdiff", y = "no.cpgs",
+   color = "maxdiff", size = 6,
+   label = "overlapping.genes", repel = TRUE,
+   font.label = c(12, "italic", "black"),
+   xlab = 'methylation loss/gain',
+   ylab = 'No. CpGs',
+    ggtheme = theme_bw(base_rect_size = 2, base_size = 20)) +
+   labs(title = 'DMRs main cohort')+
+  scale_colour_gradient(colors = my_colors)
+
+dev.off()
+```
+
+
+# Annotation DMRs with Miss Methyl
+
+## Loss regions
+```{r}
+#260 regions
+genes.loss <- dmrs %>%
+  as_tibble() %>%
+  dplyr::filter(meandiff < 0)
+
+#73 regions
+genes.gain <- dmrs %>%
+  as_tibble() %>%
+  dplyr::filter(meandiff > 0)
+
+
+#ontology testing
+gst.loss <- goregion(GRanges(genes.loss), all.cpg=rownames(M.main), 
+                       collection="GO", array.type="EPIC", plot.bias=F)
+
+table(gst.loss$FDR < 0.05)
+```
+
+
+```{r}
+gst.loss.kegg <- goregion(GRanges(genes.loss), all.cpg=rownames(M.main), 
+                       collection="KEGG", array.type="EPIC", plot.bias=F)
+table(gst.loss.kegg$FDR < 0.05)
+```
+
+
+## Gain regions
+```{r}
+#ontology testing
+gst.gain <- goregion(GRanges(genes.gain), all.cpg=rownames(M.main), 
+                       collection="GO", array.type="EPIC", plot.bias=F)
+table(gst.gain$FDR < 0.05)
+```
+
+
+```{r}
+gst.gain.kegg <- goregion(GRanges(genes.gain), all.cpg=rownames(M.main), 
+                       collection="KEGG", array.type="EPIC", plot.bias=F)
+
+table(gst.gain.kegg$FDR < 0.05)
+```
+
+
+```{r}
+top.gst.gain <- topGSA(gst.gain, number = 20)
+
+top.gst.loss <- topGSA(gst.loss, number = 20)
+```
+
+
+```{r}
+df1 <- top.gst.gain %>%
+  mutate(Coverage = (DE / N) * 100) %>%
+  mutate(Count =(N-min(N))/(max(N)-min(N))*10) %>%
+  arrange(desc(Coverage))
+
+P1 <- ggdotchart(df1, x = "TERM", y = "Coverage",
+           rotate=T, dot.size = 'Count',
+           sorting = 'desc', color = 'FDR',
+           title='DMRs hypermeth') +
+  theme_bw(base_rect_size = 2, base_size = 20)
+```
+
+
+```{r}
+df2 <- top.gst.loss %>%
+  mutate(Coverage = (DE / N) * 100) %>%
+  mutate(Count =(N-min(N))/(max(N)-min(N))*10) %>%
+  arrange(desc(Coverage))
+
+P2 <- ggdotchart(df2, x = "TERM", y = "Coverage",
+           rotate=T, dot.size = 'Count',
+           sorting = 'desc', color='FDR',
+           title='DMRs hypometh') +
+  theme_bw(base_rect_size = 2, base_size = 20)
+```
+
+
+```{r fig.width=20}
+
+# Cleaning the plots
+P1 <- P1 + rremove("legend")
+
+#png(file=file.path(plotdir,'Cowplot_DMRs_missMethyl.png'), width = 1500, height = 600)
+
+# Arranging the plot using cowplot
+plot_grid(P1, P2, align = "h", rel_widths = c(0.8,0.8))
+
+#dev.off()
+
+```
+
+
+# Model adjustment for cell counts
+```{r}
+#read in significant assocaitions
+dmps <- read.csv(file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'),row.names = 1)
+
+#Can swap in either NLRs or full blood counts into model the result is very similar
+NLR <- blood.cnt.main %>% as.matrix() %>%
+  round(digits = 2) %>%
+  as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B)) 
+
+#Model definition with DOL as factor variable
+design <- model.matrix(~as.numeric(DOL) + blood.cnt.main , meta.main)
+
+#fit M vals
+M.fit <- lmFit(Mw[dmps$ProbeID,], design)
+M.fit <- eBayes(M.fit)
+
+Mtt <- topTable(M.fit, coef = 2, number = Inf, sort.by = 'none')
+
+#fit B vals
+B.fit <- lmFit(Beta.main[dmps$ProbeID,], design)
+B.fit <- eBayes(B.fit)
+
+Btt <- topTable(B.fit, coef = 2, number = Inf, sort.by = 'none')
+
+#subset annotations
+map.sub <- map.main[dmps$ProbeID,]
+
+#EWAS statistics
+annotated <- GRanges(as.character(map.sub$chr), IRanges(map.sub$pos, 
+                map.sub$pos), 
+                stat = Mtt$t, 
+                diff = Btt$logFC, 
+                ind.fdr = Mtt$adj.P.Val, 
+                P.Value = Mtt$P.Value, 
+                is.sig = Mtt$adj.P.Val < 0.05, 
+                ProbeID=rownames(Mtt),
+                Gene=map.sub$UCSC_RefGene_Name)
+names(annotated)=rownames(Mtt)
+annotated <- sort(annotated)
+
+#individual probe result
+stats <-annotated %>%
+  as_tibble() %>%
+  arrange(ind.fdr) %>%
+  filter(is.sig)
+
+#print to screen
+table(annotated$is.sig)
+```
+
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+

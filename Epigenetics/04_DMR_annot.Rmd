@@ -1,0 +1,381 @@
+---
+title: "DMR localisation analysis"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(GenomicRanges)
+library(annotatr)
+library(regioneR)
+library(plyranges)
+library(reshape2)
+library(msigdbr)
+library(clusterProfiler)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+load(file.path(datadir,'celldmc.R'))
+dmrs <- read.csv(file = file.path(reportdir,'GAM.main.dmrs.csv'),row.names = 1)
+dmps <- read.csv(file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'),row.names = 1)
+```
+
+
+# Methylation profiles GAM Main
+
+```{r}
+# Build the annotations (a single GRanges object)
+enhancers = build_annotations(genome = 'hg19', annotations = "hg19_enhancers_fantom")
+
+genes = build_annotations(genome = 'hg19', annotations =c("hg19_basicgenes", "hg19_genes_intergenic"))
+
+cgislands = build_annotations(genome = 'hg19', annotations =c("hg19_cpg_islands","hg19_cpg_shelves", "hg19_cpg_shores"))
+```
+
+
+```{r}
+#left join on annotation file and ranges
+enhancer.ranges <- GRanges(dmps) %>%
+  join_overlap_inner(enhancers)
+
+gene.ranges <- GRanges(dmps) %>%
+  join_overlap_inner(genes)
+
+cgisland.ranges <- GRanges(dmps) %>%
+  join_overlap_inner(cgislands)
+
+promoters.r = gene.ranges[gene.ranges$type=='hg19_genes_promoters',]
+UTRs5.r = gene.ranges[gene.ranges$type=='hg19_genes_5UTRs',]
+UTRs3.r = gene.ranges[gene.ranges$type=='hg19_genes_3UTRs',]
+Exon.r = gene.ranges[gene.ranges$type=='hg19_genes_exons',]
+Intron.r = gene.ranges[gene.ranges$type=='hg19_genes_introns',]
+Intergenic.r = gene.ranges[gene.ranges$type=='hg19_genes_intergenic',]
+islands.r = cgisland.ranges[cgisland.ranges$type=="hg19_cpg_islands"]
+shores.r = cgisland.ranges[cgisland.ranges$type=="hg19_cpg_shores"]
+shelves.r = cgisland.ranges[cgisland.ranges$type=="hg19_cpg_shelves"]
+
+```
+
+
+```{r}
+#Subset to DOL probes
+Beta.sub <- Beta.main[dmps$ProbeID,]
+
+```
+
+
+```{r}
+enhancers.b <- Beta.sub[enhancer.ranges$ProbeID, ]
+promoters.b = Beta.sub[promoters.r$ProbeID,]
+UTRs5.b =  Beta.sub[UTRs5.r$ProbeID,]
+UTRs3.b =  Beta.sub[UTRs3.r$ProbeID,]
+Exon.b =  Beta.sub[Exon.r$ProbeID,]
+Intron.b =  Beta.sub[Intron.r$ProbeID,]
+Intergenic.b =  Beta.sub[Intergenic.r$ProbeID,]
+Island.b =  Beta.sub[islands.r$ProbeID,]
+Shore.b =  Beta.sub[shores.r$ProbeID,]
+Shelves.b =  Beta.sub[shelves.r$ProbeID,]
+
+```
+
+
+```{r}
+#calculate average methylation
+enhancer.means <- colMeans(enhancers.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(enhancers.b)) %>%
+  dplyr::rename('Enhancers' = 'value')
+  
+promoter.means <- colMeans(promoters.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(promoters.b)) %>%
+  dplyr::rename('Promoters' = 'value')
+
+UTRs5.means <- colMeans(UTRs5.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(UTRs5.b)) %>%
+  dplyr::rename('5UTRs' = 'value')
+
+UTRs3.means <- colMeans(UTRs3.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(UTRs3.b)) %>%
+  dplyr::rename('3UTRs' = 'value')
+
+Exons.means <- colMeans(Exon.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Exon.b)) %>%
+  dplyr::rename('Exons' = 'value')
+
+Introns.means <- colMeans(Intron.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Intron.b)) %>%
+  dplyr::rename('Introns' = 'value')
+
+Intergenic.means <- colMeans(Intergenic.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Intergenic.b)) %>%
+  dplyr::rename('Intergenic' = 'value')
+
+Island.means <- colMeans(Island.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Island.b)) %>%
+  dplyr::rename('Islands' = 'value')
+
+Shores.means <- colMeans(Shore.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Shore.b)) %>%
+  dplyr::rename('Shores' = 'value')
+
+Shelves.means <- colMeans(Shelves.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Shelves.b)) %>%
+  dplyr::rename('Shelves' = 'value')
+
+```
+
+
+```{r}
+
+meth.profile = meta.main %>%
+  left_join(Island.means) %>%
+  left_join(Shores.means) %>%
+  left_join(Shelves.means) %>%
+  left_join(Intergenic.means) %>%
+  left_join(enhancer.means) %>%
+  left_join(promoter.means) %>%
+  left_join(UTRs5.means) %>%
+  left_join(Exons.means) %>%
+  left_join(Introns.means) %>%
+  left_join(UTRs3.means) %>%
+  dplyr::select(DOL, Islands:'3UTRs')
+
+```
+
+```{r}
+data_long <- melt(meth.profile, id = "DOL") %>% # Reshaping data frame for plotting
+  dplyr::rename('% Methylation' = 'value') %>%
+  dplyr::rename('region' = 'variable')
+  
+#png(file=file.path(plotdir,'Boxplot_meth.profile.png'), width = 900, height = 500)
+ggboxplot(data_long, "region", "% Methylation",
+    fill = "DOL", palette= c('#440154','#31688E','#35B779','#FDE725'))+
+theme_bw(base_rect_size = 2, base_size = 20)+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.7))
+
+#dev.off()
+```
+
+# Stratified CpG island analysis
+```{r}
+#stratifiy the ranges
+island.promoters.r <- filter_by_overlaps(islands.r, promoters.r)
+ni.promoters.r <- filter_by_non_overlaps(islands.r, promoters.r)
+
+#extract the data points
+Island.promoter.b =  Beta.sub[island.promoters.r$ProbeID,]
+N.Island.promoter.b =  Beta.sub[ni.promoters.r$ProbeID,]
+
+#summarise the data points
+Island.promoter.means <- colMeans(Island.promoter.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Island.promoter.b)) %>%
+  dplyr::rename('Promoter.Islands' = 'value')
+
+Non.Island.promoter.means <- colMeans(N.Island.promoter.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(N.Island.promoter.b)) %>%
+  dplyr::rename('Non.Promoter.Islands' = 'value')
+
+#join to metadata
+meth.profile = meta.main %>%
+  left_join(Island.promoter.means) %>%
+  left_join(Non.Island.promoter.means) %>%
+  dplyr::select(DOL, Promoter.Islands, Non.Promoter.Islands)
+```
+
+
+```{r}
+data_long <- melt(meth.profile, id = "DOL") %>% # Reshaping data frame for plotting
+  dplyr::rename('% Methylation' = 'value') %>%
+  dplyr::rename('region' = 'variable')
+  
+#png(file=file.path(plotdir,'Boxplot_meth.profile_stratifiedislands.png'), width = 600, height = 500)
+
+ggboxplot(data_long, "region", "% Methylation",
+    fill = "DOL", palette= c('#440154','#31688E','#35B779','#FDE725'))+
+theme_bw(base_rect_size = 2, base_size = 20)+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.6))
+
+#dev.off()
+```
+
+# Methylation profiles GAM ontogeny
+```{r}
+#subset to africans
+meta.ont.gam <- subset(meta.ont, Site=='GAM')
+
+#subset data to DOL probes
+Beta.sub = Beta.ont[dmps$ProbeID, colnames(Beta.ont) %in% meta.ont.gam$Sample_Name]
+
+```
+
+
+```{r}
+enhancers.b <- Beta.sub[enhancer.ranges$ProbeID, ]
+promoters.b = Beta.sub[promoters.r$ProbeID,]
+UTRs5.b =  Beta.sub[UTRs5.r$ProbeID,]
+UTRs3.b =  Beta.sub[UTRs3.r$ProbeID,]
+Exon.b =  Beta.sub[Exon.r$ProbeID,]
+Intron.b =  Beta.sub[Intron.r$ProbeID,]
+Intergenic.b =  Beta.sub[Intergenic.r$ProbeID,]
+Island.b =  Beta.sub[islands.r$ProbeID,]
+Shore.b =  Beta.sub[shores.r$ProbeID,]
+Shelves.b =  Beta.sub[shelves.r$ProbeID,]
+
+```
+
+
+```{r}
+#calculate average methylation
+enhancer.means <- colMeans(enhancers.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(enhancers.b)) %>%
+  dplyr::rename('Enhancers' = 'value')
+  
+promoter.means <- colMeans(promoters.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(promoters.b)) %>%
+  dplyr::rename('Promoters' = 'value')
+
+UTRs5.means <- colMeans(UTRs5.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(UTRs5.b)) %>%
+  dplyr::rename('5UTRs' = 'value')
+
+UTRs3.means <- colMeans(UTRs3.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(UTRs3.b)) %>%
+  dplyr::rename('3UTRs' = 'value')
+
+Exons.means <- colMeans(Exon.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Exon.b)) %>%
+  dplyr::rename('Exons' = 'value')
+
+Introns.means <- colMeans(Intron.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Intron.b)) %>%
+  dplyr::rename('Introns' = 'value')
+
+Intergenic.means <- colMeans(Intergenic.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Intergenic.b)) %>%
+  dplyr::rename('Intergenic' = 'value')
+
+Island.means <- colMeans(Island.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Island.b)) %>%
+  dplyr::rename('Islands' = 'value')
+
+Shores.means <- colMeans(Shore.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Shore.b)) %>%
+  dplyr::rename('Shores' = 'value')
+
+Shelves.means <- colMeans(Shelves.b) %>%
+  as_tibble() %>%
+  mutate(Sample_Name = colnames(Shelves.b)) %>%
+  dplyr::rename('Shelves' = 'value')
+
+```
+
+
+```{r}
+
+meth.profile = meta.ont.gam %>%
+  left_join(Island.means) %>%
+  left_join(Shores.means) %>%
+  left_join(Shelves.means) %>%
+  left_join(Intergenic.means) %>%
+  left_join(enhancer.means) %>%
+  left_join(promoter.means) %>%
+  left_join(UTRs5.means) %>%
+  left_join(Exons.means) %>%
+  left_join(Introns.means) %>%
+  left_join(UTRs3.means) %>%
+  dplyr::select(DOL, Islands:'3UTRs')
+
+```
+
+
+```{r}
+data_long <- melt(meth.profile, id = "DOL") %>% # Reshaping data frame for plotting
+  dplyr::rename('% Methylation' = 'value') %>%
+  dplyr::rename('region' = 'variable')
+  
+#png(file=file.path(plotdir,'Boxplot_meth.profile.ont.png'), width = 900, height = 500)
+ggboxplot(data_long, "region", "% Methylation",
+    fill = "DOL", palette= c('#440154','#31688E','#35B779','#FDE725'))+
+theme_bw(base_rect_size = 2, base_size = 20)+
+theme(axis.text.x = element_text(angle = 45, vjust = 0.7))
+
+#dev.off()
+```
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+
+

@@ -1,0 +1,514 @@
+---
+title: "Sepsis Analysis"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+library(DMRcate)
+library(cowplot)
+library(methylclock)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+
+#rename Sample_Name column
+meta.main <- meta.main %>%
+  dplyr::rename(Visit_ID = Sample_Name)
+```
+
+# Estimate cell ratios
+```{r}
+blood.cnt.main <- epidish(Beta.main, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  #round(digits = 2) %>%
+  as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B + NK)) %>%
+  mutate(log_NLR = log10(NLR))
+
+blood.cnt.ont <- epidish(Beta.ont, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  #round(digits = 2) %>%
+as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B + NK)) %>%
+  mutate(log_NLR = log10(NLR))
+
+```
+
+
+## Estimate GA
+```{r}
+clocks <- DNAmGA(Beta.main, 
+                  min.perc = 0.6,
+                  cell.count = TRUE)
+```
+
+
+# Read in sepsis outcomes
+```{r}
+sepsis.id <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main-dataintegration/DavidM/221005_ID_for_collaborators.csv",
+                                         stringsAsFactors = FALSE)
+
+
+#remove  G616F as recommended by Hancock team
+to.remove <- which(sepsis.id$ID == "G616F")
+
+sepsis.id <- sepsis.id[-to.remove,]
+
+#df of HC
+
+hc.id <- as_tibble(sepsis.id) %>%
+    dplyr::select(ID_hc) %>%
+   dplyr::mutate(Classification = rep('Healthy', nrow(sepsis.id))) %>%
+   dplyr::mutate(Class_time = rep('Healthy', nrow(sepsis.id))) %>%
+   dplyr::rename('ID' = 'ID_hc')
+  
+#Append HC to bottom of sepsis.ids
+  sepsis.id <- as_tibble(sepsis.id) %>%
+    dplyr::select(ID:Class_time) %>%
+     bind_rows(hc.id)
+```
+
+# Created data frame of variables of interest
+```{r}
+
+datTraits=data.frame( 
+   Subject = as.factor(meta.main$Unique_Identifier),
+   Sample_Name = as.character(meta.main$Visit_ID),
+   Gest.Age = clocks$Bohlin,
+   Sex      =factor(as.numeric(factor(meta.main$Sex))),
+   APGAR    =as.factor(meta.main$APGAR_score),
+   Weight   =as.numeric(meta.main$Weight),
+   Fungal_infec. = as.factor(meta.main$Fungal_Contamination),
+   Visit = as.factor(meta.main$Visit_Num),
+   BirthSeason = as.factor(meta.main$Birth_season),
+   Mat.Age = (meta.main$Maternal_age),
+   NLR = round(blood.cnt.main$NLR,2),
+   log.NLR = round(blood.cnt.main$log_NLR,2),
+   Neut = round(blood.cnt.main$Neutro,2),
+   DOL = as.factor(meta.main$Days),
+   Breastfeeding = as.factor((meta.main$Breastfeeding)),
+   Mat.Ab = as.factor(meta.main$Antibodystatus),
+   VaxGrp = as.factor(meta.main$VaccineGroup))
+```
+
+
+## Include FC ratios
+
+```{r}
+
+  bcell_panel <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_BCELL_UL_BLOOD.csv",
+                                         row.names = 1,
+                                         stringsAsFactors=FALSE)
+  
+
+   myeloid_panel <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main/Clean_Data/SingleOmics/current/GAMMAIN_SINGLEOMICS_MYELOID_UL_BLOOD.csv",
+                                         row.names = 1,
+                                         stringsAsFactors=FALSE)
+
+
+colnames(bcell_panel) <- make.names(colnames(bcell_panel))  
+colnames(myeloid_panel) <- make.names(colnames(myeloid_panel))
+
+#remove flowjow exp data from sample name
+bcell_panel$name = gsub('.*(\\w{4}).*', '\\1', bcell_panel$name)
+myeloid_panel$name = gsub('.*(\\w{4}).*', '\\1', myeloid_panel$name)
+
+flowcyt <- full_join(bcell_panel[,-c(2:4)], myeloid_panel, by= c('name'))
+
+```
+
+
+```{r}
+fc.dat <- flowcyt %>%
+  dplyr::select('name','CD19..B.cells',
+                'gd..T.cells','Basophils',
+                'Classical.Monocytes',
+                'CD11b.CD16..Mature.Neutrophils',
+                'CD56.Hi.NK') %>%
+  dplyr::rename('B' = 'CD19..B.cells') %>%
+  dplyr::rename('CD3T' = 'gd..T.cells') %>%
+  dplyr::rename('Mono' = 'Classical.Monocytes') %>%
+  dplyr::rename('NK' = 'CD56.Hi.NK') %>%
+  dplyr::rename('Neutro' = 'CD11b.CD16..Mature.Neutrophils') %>%
+  dplyr::rename('Baso' = 'Basophils') %>%
+  dplyr::rename('Sample_Name' = 'name')
+
+#NLR calculation
+fc.dat$NLR.flow <- round(fc.dat$Neutro / (fc.dat$CD3T + fc.dat$B + fc.dat$NK),2)
+```
+
+
+```{r}
+#join to metadata
+cell.join = fc.dat %>%
+   dplyr::select(c(Sample_Name,NLR.flow)) %>%
+   right_join(datTraits)
+
+```
+
+
+```{r}
+#Merge with sepsis IDs 
+datSepsis <- merge(cell.join, sepsis.id, by.x= 'Subject', by.y='ID', all.x=F)
+
+v2 <- subset(datSepsis, Visit=='V2')
+v1 <- subset(datSepsis, Visit=='V1')
+```
+
+
+## Correlation between NLR measures
+```{r}
+ggscatter(datSepsis, x = "NLR.flow", y = "NLR", color = "#e69936",
+    add = "reg.line", 
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = FALSE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.sep = "\n"),
+   cor.coef.size = 6)+
+   labs(title = 'NLR.flow v NLR', x = "flow cytometry", y = "epigenetics") + 
+   theme_bw(base_rect_size = 2, base_size = 20) + 
+   theme(axis.text.x=element_text(size=20, angle=55, hjust = 1), axis.text.y=element_text(size=20))
+```
+
+
+# Epigenetic NLR
+## Association at baseline
+```{r}
+png(file=file.path(plotdir,'boxplot_sepsisv1.png'), width = 500, height = 450)
+my_comparisons <- list(  c("Healthy",'Infection'),
+                          c("Healthy", "Sepsis"))
+                        
+ 
+ ggboxplot(v1, "Classification", "NLR", order = c('Healthy','Infection','Sepsis'),
+           fill = "Classification", add = "dotplot", facet.by = 'DOL', ylim=c(0,10))+
+   theme_bw(base_rect_size = 2, base_size = 20)+
+   theme(axis.text.x = element_text(angle = 55, hjust = 1))+
+   stat_compare_means(comparisons = my_comparisons, method = 'wilcox.test')
+ dev.off()
+```
+
+
+```{r}
+#png(file=file.path(plotdir,'boxplot_sepsisv1_classtime.png'), width = 600, height = 600)
+my_comparisons <- list(  c("Healthy",'Infection'),
+                          c("Healthy", "Early_Sepsis"),
+                          c("Healthy","Late_Sepsis"))
+ 
+ ggboxplot(v1, "Class_time", "NLR", order = c('Healthy','Infection','Early_Sepsis','Late_Sepsis'),
+           fill = "Class_time", add = "dotplot",facet.by = 'DOL', ylim=c(0,10))+
+   theme_bw(base_rect_size = 2, base_size = 20)+
+   theme(axis.text.x = element_text(angle = 55, hjust = 1))+
+   stat_compare_means(comparisons = my_comparisons, method = 'wilcox.test')
+ #dev.off()
+```
+
+
+## Association at V2
+```{r}
+#png(file=file.path(plotdir,'boxplot_sepsisv2.png'), width = 600, height = 600)
+my_comparisons <- list(  c("Healthy",'Infection'),
+                          c("Healthy", "Early_Sepsis"))
+                          
+ 
+ ggboxplot(v2, "Classification", "NLR", order = c('Healthy','Infection','Sepsis'),
+           fill = "Classification", facet.by = 'DOL', add='dotplot', ylim=c(0,10))+
+   theme_bw(base_rect_size = 2, base_size = 20)+
+   theme(axis.text.x = element_text(angle = 55, hjust = 1))+
+   stat_compare_means(comparisons = my_comparisons,method = 'wilcox.test')
+ #dev.off()
+```
+
+## Association at V2 comnbined groups
+```{r}
+#png(file=file.path(plotdir,'boxplot_sepsisv2_classtime.png'), width = 600, height = 600)
+my_comparisons <- list(  c("Healthy",'Infection'),
+                          c("Healthy", "Early_Sepsis"))
+                          
+ 
+ ggboxplot(v2, "Class_time", "NLR", order = c('Healthy','Infection','Early_Sepsis','Late_Sepsis'),
+           fill = "Class_time", add='dotplot',facet.by = 'DOL', ylim=c(0,10))+
+   theme_bw(base_rect_size = 2, base_size = 20)+
+   theme(axis.text.x = element_text(angle = 55, hjust = 1))+
+   stat_compare_means(comparisons = my_comparisons,method = 'wilcox.test')
+  #dev.off()
+```
+
+
+# Linear model Epigenetic NLR
+
+## calculate birthweight and GA z-scores  
+```{r}
+#change subject and diagnosis to factors
+v1$Subject <- as.factor(as.character(v1$Subject))
+v1$Classification <- as.factor(v1$Classification)
+
+# Calculate the z-scores.
+v1$Weight.z <- (v1$Weight - mean(v1$Weight)) / sd(v1$Weight)
+v1$GA.z <- (v1$Gest.Age - mean(v1$Gest.Age)) / sd(v1$Gest.Age)
+
+```
+
+
+```{r}
+library(lme4)
+# Fit mixed effect the logistic regression model
+model <- glmer(Classification ~ log(NLR) + Sex + Weight.z + GA.z + (1 | Subject), data = v1, family = "binomial")
+
+# Summarize the model
+summary(model)
+
+##Note GEST AGE and Weight are correlated and produce non-convergence in model so z scores were included
+```
+
+
+```{r}
+#main effects model
+mod.logit <- glm(Classification ~ NLR + Sex + APGAR + Weight.z + BirthSeason + Mat.Age + Mat.Ab + Breastfeeding + GA.z, data = v1, family = "binomial")
+
+# Summarize the model
+summary(mod.logit)
+```
+
+
+```{r}
+#main effects model
+mod.logit2 <- glm(Classification ~ NLR.flow + Sex + APGAR + Weight.z + BirthSeason + Mat.Age + Mat.Ab + Breastfeeding + GA.z, data = v1, family = "binomial")
+
+# Summarize the model
+summary(mod.logit2)
+```
+
+
+# Does NLR descriminate Preterms?
+
+```{r}
+Sys.setenv(VROOM_CONNECTION_SIZE=500072)
+
+#retrieve the series matrix data in eset format
+gse <- getGEO('GSE152380', GSEMatrix = T)
+
+```
+
+```{r}
+#extract a data frame of the relevant sample annotations
+pheno = pData(phenoData(gse[[1]]))[ ,c(2,33:35)]
+
+#tidy up column names
+pheno <- pheno %>%
+   dplyr::rename('tissue' = 'tissue:ch1', 'group'='group:ch1', 'sex'='Sex:ch1')
+
+```
+
+
+```{r}
+#get raw data - idats, processed beta matrix, etc.
+getGEOSuppFiles("GSE152380",baseDir = datadir)
+#decompress idats
+untar(file.path(datadir,"GSE152380/GSE152380_RAW.tar"), exdir = "GSE152380/idat")
+
+#list files
+idatFiles <- list.files("GSE152380/idat", pattern = "idat.gz$", full = TRUE)
+#decompress individual idat files
+sapply(idatFiles, gunzip, overwrite = TRUE)
+
+#read idats and create RGSet
+```
+
+
+```{r}
+RGSet <- read.metharray.exp("GSE152380/idat")
+
+saveRDS(RGSet, "RGSet_GSE152380.RDS")
+```
+
+```{r}
+mSet = preprocessRaw(RGSet)
+beta.geo <- getBeta(mSet)
+
+#replace sample names to match pheno
+colnames(beta.geo) = pheno$geo_accession
+```
+
+```{r}
+blood.cnt.geo <- epidish(beta.geo, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2) %>%
+  as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B + NK))
+
+#add variance stabillising factor since some values a zero for some cells
+blood.cnt.geo.var <- blood.cnt.geo+0.001
+
+#Append to pheno
+pheno$NLR = blood.cnt.geo.var$NLR
+pheno$logNLR = log(pheno$NLR)
+```
+
+## Association with preterm
+```{r fig.height=6}
+my_comparisons <- list(  c("control",'preterm newborn'))
+                        
+ 
+ ggboxplot(pheno, "group", "NLR", order = c('control','preterm newborn'),
+           fill = "group", add = "dotplot")+
+   theme_bw(base_rect_size = 2, base_size = 20)+
+   theme(axis.text.x = element_text(angle = 55, hjust = 1))+
+   stat_compare_means(comparisons = my_comparisons, method = 'wilcox.test')+
+    labs(title = 'GSE152380')
+```
+
+
+# Baseline predictors of NLR
+
+```{r}
+datTraits=data.frame( 
+   Subject = as.factor(meta.main$Unique_Identifier),
+   Sample_Name = as.character(meta.main$Visit_ID),
+   Gest.Age = clocks$Bohlin,
+   Sex      =factor(as.numeric(factor(meta.main$Sex))),
+   APGAR    =as.factor(meta.main$APGAR_score),
+   Weight   =as.numeric(meta.main$Weight),
+   Fungal_infec. = as.factor(meta.main$Fungal_Contamination),
+   Visit = as.factor(meta.main$Visit_Num),
+   BirthSeason = as.factor(meta.main$Birth_season),
+   Mat.Age = (meta.main$Maternal_age),
+   NLR = round(blood.cnt.main$NLR,2),
+   Neut = round(blood.cnt.main$Neutro,2),
+   DOL = as.factor(meta.main$Days),
+   Breastfeeding = as.factor((meta.main$Breastfeeding)),
+   Mat.Ab = as.factor(meta.main$Antibodystatus),
+   VaxGrp = as.factor(meta.main$VaccineGroup),
+   SampleTime = as.numeric(meta.main$Time_from_DOB_to_Blood_Collection_.hours.))
+
+v2 <- subset(datTraits, Visit=='V2')
+v1 <- subset(datTraits, Visit=='V1')
+
+#change subject and diagnosis to factors
+v1$Subject <- as.factor(as.character(v1$Subject))
+
+# Calculate the z-scores.
+v1$Weight.z <- (v1$Weight - mean(v1$Weight)) / sd(v1$Weight)
+v1$GA.z <- (v1$Gest.Age - mean(v1$Gest.Age)) / sd(v1$Gest.Age)
+
+v2$Weight.z <- (v2$Weight - mean(v2$Weight)) / sd(v2$Weight)
+v2$GA.z <- (v2$Gest.Age - mean(v2$Gest.Age)) / sd(v2$Gest.Age)
+
+#subset V2 into DOL
+D1 <- v2[v2$DOL=='D1',]
+D3 <- v2[v2$DOL=='D3',]
+D7 <- v2[v2$DOL=='D7',]
+```
+
+
+```{r}
+#include time of breastfeeding initiation delay variable
+v1$BF.Delay = as.numeric(ifelse(v1$Breastfeeding=='No', v1$SampleTime, "0"))
+```
+
+```{r}
+mod1 <- glm(NLR ~ Sex + APGAR + Weight.z + BirthSeason + Mat.Age + Mat.Ab + Breastfeeding + GA.z, data=v1,
+           family="gaussian")
+
+summary(mod1)
+```
+
+
+```{r}
+#define residuals
+res <- resid(mod1)
+
+#produce residual vs. fitted plot
+plot(fitted(mod1), res)
+
+#add a horizontal line at 0 
+abline(0,0)
+```
+
+```{r}
+qqnorm(res)
+qqline(res) 
+```
+
+```{r}
+png(file=file.path(plotdir,'dotchart_NLRpredict.png'), width = 550, height = 450)
+
+stats <- summary(mod1)$coefficients %>% as_tibble() %>% round(2) %>%
+mutate(variable = c("intercept","sex",'apgar9','apgar10','birth.weight','birth.season','mat.age', 'mat.Ab' , 'Breastfeeding','gest.age')) 
+colnames(stats)=c("Estimate" ,  "Std.Error", "t.value"   , "Pvalue"  , "variable")
+
+ggdotchart(stats[-1,], x = "variable", y = "Estimate",
+   dot.size = 'Std.Error',
+   rotate = T,
+   sorting = "descending",color = 'Pvalue',
+   title='Regression statistics') +
+  theme_bw(base_rect_size = 2, base_size = 20)
+#ev.off()
+
+```
+
+
+# SessionInfo
+```{r}
+sessionInfo()
+
+```
+

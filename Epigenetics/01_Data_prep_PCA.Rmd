@@ -1,0 +1,332 @@
+---
+title: "EPIC-HIPC Epigenetics Ontogeny"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+```
+
+
+# Importing data
+
+## patient metadata
+```{r}
+metadata.clin <- read_meta()
+print(metadata.clin)
+```
+
+## GAM Epigenetic data set
+```{r}
+aws.s3::s3load(object= 's3://epichipc-main/Epigenetics/Rdata/Gambia_main_qc_datasets.RData')
+
+#rename the needed objects
+Beta.main <- Beta
+M.main <- M
+map.main <- map2genome
+meta.main <- metadata
+cells.main <- cellCounts
+
+#remove stuff I don't need
+rm(Beta.reps)
+rm(M.reps)
+rm(cellCounts)
+rm(metadata.reps)
+rm(Beta)
+rm(M)
+rm(map2genome)
+
+gc()
+
+#join the clinical data to the methylation sample data 
+meta.main <- meta.main %>%
+  dplyr::select(Sample_Name,Sample_Plate,Sample_Well,Array,Slide) %>%
+  left_join(metadata.clin, by=c('Sample_Name'='Visit_ID'))
+
+
+#Identify samples mismatched for sex
+mismatch = which(is.na(meta.main$Unique_Identifier))
+
+#Remove from data set
+meta.main <- meta.main[-mismatch,]
+Beta.main <- Beta.main[,-mismatch]
+M.main    <- M.main[,-mismatch]
+cells.main<- cells.main[-mismatch,]
+
+```
+
+## Ontogeny Epigenetic data set
+```{r, warning=FALSE}
+aws.s3::s3load(object= 's3://epichipc-main/Epigenetics/Rdata/final_qa_dataset.RData')
+
+rand <- aws.s3::s3read_using(read.xlsx,
+object = "s3://epichipc-main/Clinical/GAM_RandomizationGroupDefinition.xlsx") #randomization key
+
+clin <- aws.s3::s3read_using(read.csv,
+object = "s3://epichipc-main/Clean_Data/Ontogeny/Combined_Ontogeny_Tier1.csv",
+stringsAsFactors = FALSE)                                                     #clinical data
+
+#remove "Visit.Num" columns and retain 'Visit ID' columns (redundant information)
+clin = clin[,-c(4,15)]
+
+#join and shape clinical variables and randomization variables
+clinjoin = clin %>% left_join(rand) %>%
+  pivot_longer(cols= contains('Visit'), names_to= c('Visit.Identifier')) %>%
+   dplyr::arrange(`Unique.Identifier`) %>%
+   dplyr::rename(Sample_Name = value) %>%
+   dplyr::rename(DOL = Day) %>%
+   dplyr::mutate(DOL = as.factor(DOL)) %>%
+   dplyr::mutate(Weight = ifelse(Visit.Identifier=='Visit.ID.V1', 
+                                 paste(Weight..grams..V1), paste(Weight..grams..V2))) %>%
+  dplyr::mutate( Time_from_DOB_to_Blood_Collection_.hours.= round(
+                                                            as.numeric(
+                                                              ifelse( Visit.Identifier=='Visit.ID.V1',
+                                                                paste(Age.of.Sample.V1.DOB..hours.), 
+                                                                paste(Age.of.Sample.V2.V1..hours.))),1)) %>%
+  dplyr::select(! c(Weight..grams..V1, Weight..grams..V2,Age.of.Sample.V1.DOB..hours.,Age.of.Sample.V2.V1..hours.,
+                    Breastfeeding.Details.V2))
+
+#Days variable encoding
+clinjoin$Days = paste("D",clinjoin$DOL, sep="")
+clinjoin$Days = as.factor(ifelse(clinjoin$Visit.Identifier=='Visit.ID.V1', 'D0', clinjoin$Days)) 
+
+#DOL variable recoding to include DOL0
+clinjoin$DOL = as.factor(gsub("D","",clinjoin$Days))
+
+#join the clinical data to the methylation sample data
+meta.ont <- metadata %>%
+  dplyr::select(c(Sample_Name, Sample_Plate, Sample_Well, Array, Slide)) %>%
+  left_join(clinjoin)
+
+#rename the needed objects
+Beta.ont <- Beta
+M.ont <- M
+map.ont <- map2genome
+
+#get rid of the technical replicates
+reps=grep("_2", meta.ont$Sample_Name)
+
+meta.ont <- meta.ont[-reps,]
+Beta.ont <- Beta.ont[,-reps]
+M.ont    <- M.ont[,-reps]
+
+#remove stuff I don't need
+rm(Beta)
+rm(M)
+rm(metadata)
+rm(map2genome)
+rm(RGset)
+
+gc()
+
+```
+
+
+# PCA on combined data set
+```{r}
+#study ids of delayed group only
+ids <- metadata.clin %>%
+  dplyr::filter(VaccineGroup == 'Delayed') %>%
+  dplyr::select(Visit_ID)
+
+#select the autosomal probes only
+autosomes <- !map.main$chr %in% c('chrX','chrY')
+
+#subset of data by delayed group only
+beta.delayed <- Beta.main[autosomes,colnames(Beta.main) %in% ids$Visit_ID]
+
+#identify the 10k probes with largets variance
+variance.rank <- apply(beta.delayed, 1, var)
+var.rank <- sort(variance.rank, decreasing = T)
+top10k <- names(var.rank[1:10000])
+
+#subset main and ontogeny to top 10k most variable probes
+beta.delayed <- beta.delayed[top10k,]
+beta.ont.10k <- Beta.ont[rownames(Beta.ont) %in% top10k,]
+
+#combine into a single data set
+combined <- merge(beta.delayed, beta.ont.10k, by=0)
+rownames(combined) = combined$Row.names
+combined = combined[,-1]
+combined = as.matrix(combined)
+```
+
+
+```{r}
+#Principal components of M values
+pc <- prcomp(t(combined), center = TRUE, scale = TRUE,retx=TRUE)
+
+#Extract the loadings or the rotated data and the standard deviation
+loadings=pc$x
+```
+
+
+```{r fig.width=8, fig.height=8, message=FALSE}
+
+#column join the metadata from main and ontogeny cohort
+main.sub <- meta.main %>%
+  dplyr::filter(VaccineGroup == 'Delayed') %>%
+  dplyr::select(Sample_Name, Sample_Plate, Days)
+
+ont.sub <- meta.ont %>%
+  dplyr::select(Sample_Name, Sample_Plate, Days) 
+ 
+meta.merge <- main.sub %>%
+  bind_rows(ont.sub) %>%
+  mutate(Cohort = c(rep('Main',313), rep('Ontogeny',96)))
+
+```
+
+
+```{r}
+png(file.path(plotdir,'PCA_two_cohorts.png'), width = 600, height = 600 )
+
+loadings %>%
+  as_tibble(rownames = 'Sample_Name') %>%
+  dplyr::select(Sample_Name, PC1, PC2) %>%
+  dplyr::left_join(meta.merge) %>%
+ggscatter(x = "PC1", y = "PC2",
+   color = "Cohort", shape = "Cohort",
+   palette = c("jco"),
+   ellipse = TRUE, mean.point = TRUE,
+   star.plot = TRUE) +
+  theme(aspect.ratio = 1)+
+  theme_bw(base_size = 20)
+
+dev.off()
+
+```
+
+
+```{r}
+#put in bucket
+put_object(
+     file = "/home/dmartino/Epigenetics_analysis/plots/PCA_two_cohorts.png",
+     object = "DavidM/PCA_two_cohorts.png",
+     bucket = "s3://epichipc-main-dataintegration/"
+)
+```
+
+
+```{r}
+png(file.path(plotdir,'PCA_two_cohorts_DOL.png'), width = 1200, height = 600 )
+
+loadings %>%
+  as_tibble(rownames = 'Sample_Name') %>%
+  dplyr::select(Sample_Name, PC1, PC2) %>%
+  dplyr::left_join(meta.merge) %>%
+ggscatter(x = "PC1", y = "PC2",
+   color = "Days", shape = "Cohort",
+   facet.by = 'Cohort',
+   palette = c("jco"),
+   ellipse = TRUE, mean.point = TRUE,
+   star.plot = TRUE) +
+  theme(aspect.ratio = 1)+
+  theme_bw(base_size = 20)
+
+dev.off()
+
+```
+
+
+```{r}
+#put in bucket
+put_object(
+     file = "/home/dmartino/Epigenetics_analysis/plots/PCA_two_cohorts_DOL.png",
+     object = "DavidM/PCA_two_cohorts_DOL.png",
+     bucket = "s3://epichipc-main-dataintegration/"
+)
+```
+
+```{r}
+png(file.path(plotdir,'PCA_two_cohorts_Plate.png'), width = 600, height = 600 )
+
+cols = pal_npg("nrc", alpha = 0.7)(9)
+cols = colorRampPalette(cols)(20)
+
+loadings %>%
+  as_tibble(rownames = 'Sample_Name') %>%
+  dplyr::select(Sample_Name, PC1, PC2) %>%
+  dplyr::left_join(meta.merge) %>%
+ggscatter(x = "PC1", y = "PC2",
+   color = "Sample_Plate", shape = "Cohort",
+   palette = cols,
+   ellipse = TRUE, mean.point = TRUE,
+   star.plot = TRUE) +
+  theme(aspect.ratio = 1)+
+  theme_bw(base_size = 20)
+
+dev.off()
+
+```
+
+
+```{r}
+#put in bucket
+put_object(
+     file = "/home/dmartino/Epigenetics_analysis/plots/PCA_two_cohorts_Plate.png",
+     object = "DavidM/PCA_two_cohorts_Plate.png",
+     bucket = "s3://epichipc-main-dataintegration/"
+)
+```
+
+# Saving all objects for analysis
+```{r}
+save(Beta.ont, M.ont, meta.ont, map.ont, Beta.main, M.main, map.main,meta.main, cells.main, file='savedenvirons.rdata')
+```
+
+#Session Info
+```{r}
+sessionInfo()
+```
+

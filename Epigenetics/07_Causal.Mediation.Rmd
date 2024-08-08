@@ -1,0 +1,506 @@
+---
+title: "Mediation Analysis"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+library(DMRcate)
+library(cowplot)
+library(mCSEA)
+library(lmerTest)
+library(mediation)
+```
+
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+
+#rename Sample_Name column
+meta.main <- meta.main %>%
+  dplyr::rename(Visit_ID = Sample_Name)
+```
+
+# Estimate cell ratios
+```{r}
+blood.cnt.main <- epidish(Beta.main, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2) %>%
+  as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B)) %>%
+  mutate(log_NLR = log10(NLR))
+
+blood.cnt.ont <- epidish(Beta.ont, ref.m = centDHSbloodDMC.m, method = "RPC")$estF %>%
+  as.matrix() %>%
+  round(digits = 2) %>%
+as_tibble() %>%
+  mutate( NLR = Neutro / (CD4T + CD8T + B)) %>%
+  mutate(log_NLR = log10(NLR))
+
+```
+
+
+# Create data set of RUNX3 leading edge CpGs
+
+```{r}
+
+runx.lead <- c('cg16063783', 'cg13461622', 'cg09993145', 'cg04554131', 'cg06640822', 'cg07236781')
+
+#get runx promoter regions
+runx3.prom <- mCSEAdata::assocPromotersEPIC$RUNX3
+
+#selects for the leading CpGs that are in the promoters
+runx3.probes = runx.lead[runx.lead %in% runx3.prom]
+
+#create a data set of methylation at runx3 promoter
+runx3.meth = data.frame( Visit_ID = colnames(Beta.main),
+                           runx3.meth = colMeans(Beta.main[runx3.probes, ]))
+
+```
+
+
+# Create a data set of clinical data for main cohort
+
+## Read in sepsis outcomes
+```{r}
+sepsis.id <- aws.s3::s3read_using(read.csv,
+                                         object = "s3://epichipc-main-dataintegration/DavidM/221005_ID_for_collaborators.csv",
+                                         stringsAsFactors = FALSE)
+  
+  #remove HC ID
+  sepsis.id <- as_tibble(sepsis.id) %>%
+    dplyr::select(ID:Class_time) 
+```
+
+```{r}
+datTraits=data.frame( 
+   Subject = as.factor(meta.main$Unique_Identifier),
+   Sex      =factor(as.numeric(factor(meta.main$Sex))),
+   APGAR    =as.factor(meta.main$APGAR_score),
+   Weight   =as.numeric(meta.main$Weight),
+   Fungal_infec. = as.factor(meta.main$Fungal_Contamination),
+   Visit = as.factor(meta.main$Visit_Num),
+   BirthSeason = as.factor(meta.main$Birth_season),
+   Mat.Age = (meta.main$Maternal_age),
+   NLR = round(blood.cnt.main$NLR,2),
+   Neut = round(blood.cnt.main$Neutro,2),
+   CD4T = round(blood.cnt.main$CD4T,2),
+   DOL = as.numeric(meta.main$Days),
+   VaxGrp = as.factor(meta.main$VaccineGroup),
+   runx3 = as.numeric(runx3.meth$runx3.meth))
+
+#Merge with sepsis IDs 
+ datTraits <- merge(datTraits, sepsis.id, by.x= 'Subject', by.y='ID', all.x=T)
+ 
+ #re-classify NAs to healthy
+ datTraits$Class_time = ifelse(is.na(datTraits$Class_time), paste('healthy'), datTraits$Class_time)
+ datTraits$Classification = ifelse(is.na(datTraits$Classification), paste('healthy'), datTraits$Classification)
+```
+
+# Causal mediation analysis
+
+## Part  1 - initial variable and outcome (Total effect) 
+```{r}
+fit.total <- lmer(Neut ~ DOL + (1|Subject) , 
+                   data=datTraits)
+summary(fit.total)
+```
+
+## Part  2 - initial variable affects mediator 
+```{r}
+fit.mediator <- lmer(runx3 ~ DOL + (1|Subject) , 
+                   data=datTraits)
+                   
+summary(fit.mediator)
+```
+
+## Part  3 - show that the mediator affects outcome
+
+```{r}
+fit.dep <- lmer(Neut ~ runx3 + DOL + (1|Subject) , 
+                   data=datTraits)
+summary(fit.dep)
+```
+
+## Estimate mediation
+```{r}
+fit.mediator <- lm(runx3 ~ DOL, 
+                   data=datTraits)
+
+fit.dep <- lm(Neut ~ runx3 + DOL, 
+                   data=datTraits)
+
+
+results = mediate(fit.mediator, fit.dep, treat='DOL', mediator='runx3', boot=T)
+summary(results)
+```
+
+# Multiple mediation analysis
+
+## Create data set of RUNX3 leading edge CpGs
+
+```{r}
+
+#get runx promoter regions
+#runx3.prom <- mCSEAdata::assocPromotersEPIC$RUNX3
+runx3.lead <- 'cg13461622'
+
+#get TCF7 promoter regions
+#tcf7.prom <- mCSEAdata::assocPromotersEPIC$TCF7
+tcf7.lead <- 'cg02182856'
+
+#get nr3c1 promoter regions
+#nr3c1.prom <- mCSEAdata::assocPromotersEPIC$NR3C1
+
+#get nfe2 promoter regions
+#nfe2.prom <- mCSEAdata::assocPromotersEPIC$NFE2
+nfe2.lead <- 'cg23140706'
+
+#get rnf10 promoter regions
+#rnf10.prom <- mCSEAdata::assocPromotersEPIC$RNF10
+
+#get bach2 promoter regions
+#bach2.prom <- mCSEAdata::assocPromotersEPIC$BACH2
+bach2.lead <- 'cg21335325'
+
+#create a data set of methylation at runx3 promoter
+TF.meth = data.frame( Visit_ID = colnames(Beta.main),
+                           runx3.meth = Beta.main[runx3.lead, ],
+                          tcf7.meth = Beta.main[tcf7.lead, ],
+                      nfe2.meth = Beta.main[nfe2.lead, ],
+                      bach2.meth = Beta.main[bach2.lead, ])
+                        
+TF.meth$avg <- rowMeans(TF.meth[,-1])
+
+
+
+```
+
+```{r}
+datTraits=data.frame( 
+   Subject = as.factor(meta.main$Unique_Identifier),
+   Sex      =factor(as.numeric(factor(meta.main$Sex))),
+   APGAR    =as.factor(meta.main$APGAR_score),
+   Weight   =as.numeric(meta.main$Weight),
+   Fungal_infec. = as.factor(meta.main$Fungal_Contamination),
+   Visit = as.factor(meta.main$Visit_Num),
+   BirthSeason = as.factor(meta.main$Birth_season),
+   Mat.Age = (meta.main$Maternal_age),
+   NLR = round(blood.cnt.main$NLR,2),
+   Neut = round(blood.cnt.main$Neutro,2),
+   CD4T = round(blood.cnt.main$CD4T,2),
+   CD8T = round(blood.cnt.main$CD8T,2),
+   DOL = as.numeric(meta.main$Days),
+   VaxGrp = as.numeric(meta.main$VaccineGroup),
+   runx3 = as.numeric(TF.meth$runx3.meth),
+   tcf7 = as.numeric(TF.meth$tcf7.meth),
+   bach2 = as.numeric(TF.meth$bach2.meth),
+   nfe2 = as.numeric(TF.meth$nfe2.meth),
+   avg = as.numeric(TF.meth$avg))
+
+#Merge with sepsis IDs 
+ datTraits <- merge(datTraits, sepsis.id, by.x= 'Subject', by.y='ID', all.x=T)
+ 
+ #re-classify NAs to healthy
+ datTraits$Class_time = ifelse(is.na(datTraits$Class_time), paste('healthy'), datTraits$Class_time)
+ datTraits$Classification = ifelse(is.na(datTraits$Classification), paste('healthy'), datTraits$Classification)
+ 
+ #remove outlier
+ to.remove <- which(datTraits$NLR >= 60)
+ 
+ datTraits <- datTraits[-to.remove,]
+```
+
+
+```{r}
+# melt to long format
+df <- datTraits %>%
+  dplyr::select(DOL,tcf7,bach2,nfe2,runx3) %>%
+   melt(id = "DOL")%>%
+  dplyr::rename('% Methylation' = 'value') %>%
+  dplyr::rename('feature' = 'variable')
+  
+png(file=file.path(plotdir,'Violin_TF.png'), width = 450, height = 450)
+ggline(df, "DOL", "% Methylation",
+   linetype = "feature", shape = "feature",add =c("mean", "violin"),size=1.5,
+   color = "feature")+
+theme_bw(base_rect_size = 2, base_size = 20)+
+  labs(title = 'Trend in promoter methylation')
+dev.off()
+```
+
+```{r}
+png(file=file.path(plotdir,'Violin_cells.png'), width = 450, height = 450)
+
+# melt to long format
+df <- datTraits %>%
+  dplyr::select(DOL,CD4T,CD8T,Neut) %>%
+   melt(id = "DOL")%>%
+  dplyr::rename('cell proportion' = 'value') %>%
+  dplyr::rename('cell_type' = 'variable')
+
+ggline(df, "DOL", "cell proportion",
+   linetype = "cell_type", shape = "cell_type",
+   add =c("mean", "violin"),size=1.5,
+   color = "cell_type")+
+theme_bw(base_rect_size = 2, base_size = 20)+
+  labs(title = 'Trend in cell proportions')
+
+dev.off()
+```
+
+## Estimate mediation
+
+### runx3
+```{r}
+fit.mediator <- lm(runx3 ~ Visit, 
+                   data=datTraits)
+
+fit.dep <- lm(NLR ~ Visit + runx3 , 
+                   data=datTraits)
+
+
+results = mediate(fit.mediator, fit.dep, treat='Visit', mediator='runx3', boot=T)
+summary(results)
+```
+
+```{r}
+png(file=file.path(plotdir,'runx3.stat.png'), width = 250, height = 250)
+plot(results, main ='RUNX3', xlab='Point estimate (95 CI)')
+dev.off()
+```
+
+### bach2
+```{r}
+fit.mediator <- lm(bach2 ~ Visit, 
+                   data=datTraits)
+
+fit.dep <- lm(NLR ~ Visit + bach2 , 
+                   data=datTraits)
+
+
+results = mediate(fit.mediator, fit.dep, treat='Visit', mediator='bach2', boot=T)
+summary(results)
+```
+
+```{r}
+png(file=file.path(plotdir,'bach2.stat.png'), width = 250, height = 250)
+plot(results, main ='BACH2', xlab='Point estimate (95 CI)')
+dev.off()
+```
+
+### tcf7
+```{r}
+fit.mediator <- lm(tcf7 ~ Visit, 
+                   data=datTraits)
+
+fit.dep <- lm(NLR ~ Visit + tcf7 , 
+                   data=datTraits)
+
+
+results = mediate(fit.mediator, fit.dep, treat='Visit', mediator='tcf7', boot=T)
+summary(results)
+```
+
+
+```{r}
+png(file=file.path(plotdir,'tcf7.stat.png'), width = 250, height = 250)
+plot(results, main ='TCF7', xlab='Point estimate (95 CI)')
+dev.off()
+```
+
+
+### nfe2
+```{r}
+fit.mediator <- lm(nfe2 ~ Visit, 
+                   data=datTraits)
+
+fit.dep <- lm(NLR ~ Visit + nfe2 , 
+                   data=datTraits)
+
+
+results = mediate(fit.mediator, fit.dep, treat='Visit', mediator='nfe2', boot=T)
+df <- summary(results)
+nfe2.stat <- data.frame(ACME =df$d0,
+                           ACME.ci=df$d0.ci,
+                           ADE=df$d1,
+                           ADE.ci=df$d1.ci)
+```
+
+```{r}
+png(file=file.path(plotdir,'nfe2.stat.png'), width = 250, height = 250)
+plot(results, main ='NFE2', xlab='Point estimate (95 CI)')
+dev.off()
+```
+
+## Create data set of RUNX3 leading edge CpGs
+
+```{r}
+
+#get runx promoter regions
+#runx3.prom <- mCSEAdata::assocPromotersEPIC$RUNX3
+runx3.lead <- 'cg13461622'
+
+#get TCF7 promoter regions
+#tcf7.prom <- mCSEAdata::assocPromotersEPIC$TCF7
+tcf7.lead <- 'cg02182856'
+
+#get nr3c1 promoter regions
+#nr3c1.prom <- mCSEAdata::assocPromotersEPIC$NR3C1
+
+#get nfe2 promoter regions
+#nfe2.prom <- mCSEAdata::assocPromotersEPIC$NFE2
+nfe2.lead <- 'cg23140706'
+
+#get rnf10 promoter regions
+#rnf10.prom <- mCSEAdata::assocPromotersEPIC$RNF10
+
+#get bach2 promoter regions
+#bach2.prom <- mCSEAdata::assocPromotersEPIC$BACH2
+bach2.lead <- 'cg21335325'
+
+#create a data set of methylation at runx3 promoter
+TF.meth = data.frame( Visit_ID = colnames(Beta.main),
+                           runx3.meth = Beta.main[runx3.lead, ],
+                          tcf7.meth = Beta.main[tcf7.lead, ],
+                      nfe2.meth = Beta.main[nfe2.lead, ],
+                      bach2.meth = Beta.main[bach2.lead, ])
+                        
+TF.meth$avg <- rowMeans(TF.meth[,-1])
+
+
+
+```
+
+```{r}
+datTraits=data.frame( 
+   Subject = as.factor(meta.main$Unique_Identifier),
+   Sex      =factor(as.numeric(factor(meta.main$Sex))),
+   APGAR    =as.factor(meta.main$APGAR_score),
+   Weight   =as.numeric(meta.main$Weight),
+   Fungal_infec. = as.factor(meta.main$Fungal_Contamination),
+   Visit = as.factor(meta.main$Visit_Num),
+   BirthSeason = as.factor(meta.main$Birth_season),
+   Mat.Age = (meta.main$Maternal_age),
+   NLR = round(blood.cnt.main$NLR,2),
+   Neut = round(blood.cnt.main$Neutro,2),
+   CD4T = round(blood.cnt.main$CD4T,2),
+   CD8T = round(blood.cnt.main$CD8T,2),
+   DOL = as.numeric(meta.main$Days),
+   VaxGrp = as.numeric(meta.main$VaccineGroup),
+   runx3 = as.numeric(TF.meth$runx3.meth),
+   tcf7 = as.numeric(TF.meth$tcf7.meth),
+   bach2 = as.numeric(TF.meth$bach2.meth),
+   nfe2 = as.numeric(TF.meth$nfe2.meth),
+   avg = as.numeric(TF.meth$avg))
+
+#Merge with sepsis IDs 
+ datTraits <- merge(datTraits, sepsis.id, by.x= 'Subject', by.y='ID', all.x=T)
+ 
+ #re-classify NAs to healthy
+ datTraits$Class_time = ifelse(is.na(datTraits$Class_time), paste('healthy'), datTraits$Class_time)
+ datTraits$Classification = ifelse(is.na(datTraits$Classification), paste('healthy'), datTraits$Classification)
+ 
+ #remove outlier
+ to.remove <- which(datTraits$NLR >= 60)
+ 
+ datTraits <- datTraits[-to.remove,]
+```
+
+
+```{r}
+# melt to long format
+df <- datTraits %>%
+  dplyr::select(DOL,tcf7,bach2,nfe2,runx3) %>%
+   melt(id = "DOL")%>%
+  dplyr::rename('% Methylation' = 'value') %>%
+  dplyr::rename('feature' = 'variable')
+  
+png(file=file.path(plotdir,'Violin_TF.png'), width = 450, height = 450)
+ggline(df, "DOL", "% Methylation",
+   linetype = "feature", shape = "feature",add =c("mean", "violin"),size=1.5,
+   color = "feature")+
+theme_bw(base_rect_size = 2, base_size = 20)+
+  labs(title = 'Trend in promoter methylation')
+dev.off()
+```
+
+```{r}
+png(file=file.path(plotdir,'Violin_cells.png'), width = 450, height = 450)
+
+# melt to long format
+df <- datTraits %>%
+  dplyr::select(DOL,CD4T,CD8T,Neut) %>%
+   melt(id = "DOL")%>%
+  dplyr::rename('cell proportion' = 'value') %>%
+  dplyr::rename('cell_type' = 'variable')
+
+ggline(df, "DOL", "cell proportion",
+   linetype = "cell_type", shape = "cell_type",
+   add =c("mean", "violin"),size=1.5,
+   color = "cell_type")+
+theme_bw(base_rect_size = 2, base_size = 20)+
+  labs(title = 'Trend in cell proportions')
+
+dev.off()
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
+

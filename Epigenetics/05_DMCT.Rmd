@@ -1,0 +1,210 @@
+---
+title: "DMCT"
+author: |
+  Telethon Kids Institute
+  University of Western Australia
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, echo = FALSE}
+library(knitr)
+opts_chunk$set(fig.height = 10, fig.width = 10)
+```
+
+**Project**   
+*EPIC-HIPC project*  
+*PI: David Martino (epigenetics) Tobias Kollman (HIPC)*  
+*david.martino@telethonkids.org.au*  
+*tobias.kollmann@telethonkids.org.au*  
+
+**Protocol**  
+*Cell type: Whole Blood*  
+*Extraction method: Bead based, Chemagic DNA 400 kit H96 (Cat# CMG-1491)*  
+*Assay:Human Methylation EPIC array*  
+
+**Data Generation**  
+*Extracted DNA send to AGRF Genotyping Service.*  
+*Contact: Melinda Ziino <melinda.ziino@agrf.org.au>* 
+
+
+# Setup
+## Directories
+```{r}
+datadir <- "/home/dmartino/Epigenetics_analysis"
+plotdir <- "/home/dmartino/Epigenetics_analysis/plots"
+reportdir <- "/home/dmartino/Epigenetics_analysis/tables"
+scrdir <- "/home/dmartino/Epigenetics_analysis/scripts"
+```
+
+## load code base
+```{r message=FALSE}
+source(file.path(scrdir,'codeBasePipeline_EPICHIPC.R'))
+```
+
+## Call additional libraries
+```{r message=FALSE, warning=FALSE}
+library(aws.s3)
+library(aws.signature)
+library(aws.ec2metadata)
+library(minfi)
+library(DMRcate)
+library(GenomicRanges)
+library(EpiDISH)
+library(DMRcate)
+library(cowplot)
+library(ggvenn)
+library(plyranges)
+library(UpSetR)
+```
+
+
+# Importing data sets
+
+# Importing data sets
+
+```{r}
+load(file.path(datadir,'savedenvirons.rdata'))
+load(file.path(datadir,'celldmc.R'))
+dmrs <- read.csv(file = file.path(reportdir,'GAM.main.dmrs.csv'),row.names = 1)
+dmps <- read.csv(file = file.path(reportdir,'GAM.main.DOL.dmps_DB0.2.csv'),row.names = 1)
+dmct <- read.csv(file= file.path(reportdir,'Epidish_out_DMCT.flt.csv'), row.names=1)
+
+head(dmct)
+```
+
+# Defining regions of gain / loss
+```{r}
+#260 regions
+genes.loss <- dmrs %>%
+  as_tibble() %>%
+  dplyr::filter(meandiff < 0)
+
+#73 regions
+genes.gain <- dmrs %>%
+  as_tibble() %>%
+  dplyr::filter(meandiff > 0)
+```
+
+# Partioning DMRs to cells
+```{r}
+
+#create GRanges of DMRs
+gr <- GRanges(seqnames=map.main$chr, 
+                       ranges=IRanges(start=map.main$pos,end=map.main$pos+1),
+                       strand=map.main$strand,
+                       ProbeID=map.main$Name)
+
+
+# subset to hypo dmrs
+hypo.dmr.probes <- GRanges(genes.loss) %>%
+  join_overlap_inner(gr)
+
+# subset to hyper dmrs
+hyper.dmr.probes <- GRanges(genes.gain) %>%
+  join_overlap_inner(gr)
+```
+
+```{r}
+#subset the dmct object according to probes in hypo / hyper DMRs
+hypo.dmct <- dmct[dmct$ProbeID %in% hypo.dmr.probes$ProbeID,]
+
+hyper.dmct <- dmct[dmct$ProbeID %in% hyper.dmr.probes$ProbeID,]
+```
+
+
+```{r}
+B.up <- hyper.dmct %>%
+  summarise(count=sum(abs(B)))
+  
+B.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(B)))
+
+NK.up <- hyper.dmct %>%
+  summarise(count=sum(abs(NK)))
+  
+NK.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(NK)))
+
+CD4T.up <- hyper.dmct %>%
+  summarise(count=sum(abs(CD4T)))
+  
+CD4T.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(CD4T)))
+
+CD8T.up <- hyper.dmct %>%
+  summarise(count=sum(abs(CD8T)))
+  
+CD8T.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(CD8T)))
+
+Mono.up <- hyper.dmct %>%
+  summarise(count=sum(abs(Mono)))
+  
+Mono.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(Mono)))
+
+Neutro.up <- hyper.dmct %>%
+  summarise(count=sum(abs(Neutro)))
+  
+Neutro.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(Neutro)))
+
+Eosino.up <- hyper.dmct %>%
+  summarise(count=sum(abs(Eosino)))
+  
+Eosino.dn <- hypo.dmct %>%
+  summarise(count=sum(abs(Eosino)))
+
+df = data.frame( cell = colnames(dmct[,-8]),
+                group = rep(c('hyper','hypo'), each=7),
+                DM.cpgs = c(as.numeric(B.up), as.numeric(NK.up), as.numeric(CD4T.up),as.numeric(CD8T.up),
+                as.numeric(Mono.up),as.numeric(Neutro.up),as.numeric(Eosino.up),
+                as.numeric(-B.dn),as.numeric(-NK.dn),as.numeric(-CD4T.dn),as.numeric(-CD8T.dn),
+                as.numeric(-Mono.dn),as.numeric(-Neutro.dn),as.numeric(-Eosino.dn))
+                )
+
+```
+
+## Data visualisation
+```{r}
+#png(file=file.path(plotdir,'Barchart.EpiDish.png'), width = 600, height = 400)
+
+ggbarplot(df, x = "cell", y = "DM.cpgs",
+          fill = "cell",               # change fill color by cyl
+          color = "white",            # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          order = c('Neutro','B','CD4T','NK','Eosino','CD8T','Mono')) + 
+  theme_bw(base_rect_size = 2, base_size = 20) + 
+  theme(plot.title = element_text(hjust = 0.5), 
+        axis.text = element_text(face = "bold"))+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.8))
+
+#dev.off()
+```
+
+
+# What is the degree of sharing?
+```{r fig.height=8}
+#Sharing by absolute number of associations (irrespective of sign)
+dmct.dmrs = rbind(hypo.dmct,hyper.dmct)
+
+#png(file=file.path(plotdir,'Upsetplot_dmct_dmrs.png'), width = 600, height = 500)
+upset(abs(dmct.dmrs[,-8]), 
+      sets = c("B", "NK", "CD4T","CD8T","Mono","Neutro","Eosino"), 
+      order.by="freq", matrix.color="blue", point.size=5, text.scale = 2,
+      sets.x.label = "CpGs Per Cell",
+      sets.bar.color=c("maroon","blue","orange","green","yellow","purple","red"))
+#dev.off()
+```
+
+# Session Inf
+```{r}
+sessionInfo()
+```
+
