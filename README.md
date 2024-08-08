@@ -1,1 +1,1 @@
-# epichipc
+# Public repository for EPICHIPC manuscript
